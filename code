@@ -1,0 +1,324 @@
+# =====================================
+# 0. 导入依赖
+# =====================================
+import os, glob, math, random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+import torch.nn.functional as F
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+IMG_W, IMG_H = 1920, 1080
+
+
+# =====================================
+# 1. 数据解析 (YOLO-OBB track_label) + 自动均衡采样
+# =====================================
+def parse_track_labels_obb(label_dir, img_w=1920, img_h=1080):
+    """
+    解析 YOLO-OBB track_label 文件
+    每行格式: cls x1 y1 x2 y2 x3 y3 x4 y4 conf track_id
+    返回 DataFrame: [track_id, frame, cls, x, y, w, h, angle, conf]
+    """
+    records = []
+    files = sorted(glob.glob(os.path.join(label_dir, "*.txt")))
+    for file in files:
+        try:
+            frame = int(os.path.splitext(file)[0].split("_V_")[-1])
+        except:
+            frame = None
+        with open(file, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 11:
+                    continue
+                cls = int(parts[0])
+                coords = list(map(float, parts[1:9]))
+                conf = float(parts[9])
+                track_id = int(parts[10])
+
+                pts = np.array(coords).reshape(4,2)
+                pts[:,0] *= img_w
+                pts[:,1] *= img_h
+
+                cx, cy = np.mean(pts[:,0]), np.mean(pts[:,1])
+                w = max(pts[:,0]) - min(pts[:,0])
+                h = max(pts[:,1]) - min(pts[:,1])
+                dx, dy = pts[1][0]-pts[0][0], pts[1][1]-pts[0][1]
+                angle = np.degrees(np.arctan2(dy, dx))
+
+                records.append([track_id, frame, cls, cx, cy, w, h, angle, conf])
+
+    df = pd.DataFrame(records, columns=["track_id","frame","cls","x","y","w","h","angle","conf"])
+    df = df.dropna(subset=["frame"])
+    df["frame"] = df["frame"].astype(int)
+    return df
+
+
+def build_samples(df, T_obs=8, T_pred=12, stride=1, img_w=1920, img_h=1080, balance=True):
+    """
+    构造样本，并可选自动均衡左右转意图样本
+    """
+    samples = []
+    for tid, g in df.groupby("track_id"):
+        g = g.sort_values("frame")
+        xs = g["x"].values / img_w
+        ys = g["y"].values / img_h
+        angles = g["angle"].values
+
+        for start in range(0, len(g) - (T_obs + T_pred) + 1, stride):
+            obs_idx = range(start, start+T_obs)
+            pred_idx = range(start+T_obs, start+T_obs+T_pred)
+
+            obs_feats = []
+            for i in obs_idx:
+                ang = np.deg2rad(angles[i])
+                obs_feats.append([xs[i], ys[i], np.sin(ang), np.cos(ang)])
+
+            fut_xy = np.stack([xs[pred_idx], ys[pred_idx]], axis=1)
+            delta_ang = angles[pred_idx[-1]] - angles[obs_idx[-1]]
+
+            if delta_ang > 12: intent = 0  # left
+            elif delta_ang < -12: intent = 2  # right
+            else: intent = 1  # straight
+
+            samples.append((np.array(obs_feats, dtype=np.float32),
+                            np.array(fut_xy, dtype=np.float32),
+                            intent))
+
+    if not balance:
+        return samples
+
+    # ====== 自动均衡采样 ======
+    intents = [s[2] for s in samples]
+    counter = Counter(intents)
+    print(f"Intent counts (before balance): {counter}")
+
+    max_count = max(counter.values())
+    balanced = []
+    for s in samples:
+        obs, fut, intent = s
+        repeat = int(max_count / counter[intent])
+        # 为左右转增强
+        if intent in [0, 2]:
+            repeat = int(repeat * 2)
+        for _ in range(max(1, repeat)):
+            balanced.append(s)
+
+    print(f"After balancing, total samples: {len(balanced)}")
+    return balanced
+
+
+# =====================================
+# 2. Dataset & DataLoader
+# =====================================
+class TrajectoryDataset(Dataset):
+    def __init__(self, samples):
+        self.samples = samples
+    def __len__(self):
+        return len(self.samples)
+    def __getitem__(self, idx):
+        obs, fut, intent = self.samples[idx]
+        return torch.tensor(obs), torch.tensor(fut), torch.tensor(intent)
+
+
+# =====================================
+# 3. 模型定义
+# =====================================
+class TrajLSTM(nn.Module):
+    def __init__(self, in_dim=4, hid=128, num_layers=2, out_dim=2, n_classes=3):
+        super().__init__()
+        self.enc = nn.LSTM(in_dim, hid, num_layers, batch_first=True)
+        self.dec = nn.LSTM(out_dim, hid, num_layers, batch_first=True)
+        self.fc_out = nn.Linear(hid, out_dim)
+        self.fc_intent = nn.Linear(hid, n_classes)
+
+    def forward(self, obs, fut_len=12):
+        _, (h, c) = self.enc(obs)
+        dec_in = obs[:, -1:, :2]
+        preds = []
+        for _ in range(fut_len):
+            out, (h, c) = self.dec(dec_in, (h, c))
+            step = self.fc_out(out)
+            preds.append(step)
+            dec_in = step
+        preds = torch.cat(preds, dim=1)
+        intent_logits = self.fc_intent(h[-1])
+        return preds, intent_logits
+
+
+# =====================================
+# 4. FocalLoss 定义（用于分类分支）
+# =====================================
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(logits, targets, weight=self.alpha, reduction="none")
+        pt = torch.exp(-ce_loss)
+        loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
+
+
+# =====================================
+# 5. 可视化函数
+# =====================================
+def plot_trajectory(obs, fut, pred, img_w=1920, img_h=1080, save_path=None):
+    obs_px = obs.copy()
+    fut_px = fut.copy()
+    pred_px = pred.copy()
+
+    obs_px[:,0] *= img_w
+    obs_px[:,1] *= img_h
+    fut_px[:,0] *= img_w
+    fut_px[:,1] *= img_h
+    pred_px[:,0] *= img_w
+    pred_px[:,1] *= img_h
+
+    plt.figure(figsize=(6,6))
+    plt.plot(obs_px[:,0], obs_px[:,1], "bo-", label="Observed")
+    plt.plot(fut_px[:,0], fut_px[:,1], "go-", label="Ground Truth")
+    plt.plot(pred_px[:,0], pred_px[:,1], "ro--", label="Predicted")
+    plt.legend()
+    plt.gca().invert_yaxis()
+    if save_path:
+        plt.savefig(save_path, dpi=200)
+    plt.show()
+
+
+# =====================================
+# 6. 训练 + 验证（FocalLoss + 均衡采样）
+# =====================================
+def train_model(model, train_loader, val_loader, epochs=20, lr=1e-3, img_w=1920, img_h=1080):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_pos = nn.MSELoss()
+    class_weights = torch.tensor([2.0, 0.5, 2.0]).to(device)
+    loss_int = FocalLoss(alpha=class_weights, gamma=2.0).to(device)
+
+    history = {"ade":[], "fde":[], "acc":[]}
+
+    for ep in range(epochs):
+        model.train()
+        total_loss = 0
+        for obs, fut, intent in train_loader:
+            obs, fut, intent = obs.to(device), fut.to(device), intent.to(device)
+            preds, logits = model(obs, fut_len=fut.shape[1])
+            l_pos = loss_pos(preds, fut)
+            l_int = loss_int(logits, intent)
+            loss = l_pos * 10.0 + l_int
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {ep+1}/{epochs} | Train Loss: {total_loss/len(train_loader):.4f}", end=" | ")
+
+        # ====== 验证 ======
+        model.eval()
+        all_preds, all_gt, all_int, all_logits, all_obs = [], [], [], [], []
+        with torch.no_grad():
+            for obs, fut, intent in val_loader:
+                obs, fut, intent = obs.to(device), fut.to(device), intent.to(device)
+                preds, logits = model(obs, fut_len=fut.shape[1])
+                all_preds.append(preds.cpu().numpy())
+                all_gt.append(fut.cpu().numpy())
+                all_int.append(intent.cpu().numpy())
+                all_logits.append(logits.cpu().numpy())
+                all_obs.append(obs.cpu().numpy())
+
+        all_preds = np.concatenate(all_preds)
+        all_gt = np.concatenate(all_gt)
+        all_int = np.concatenate(all_int)
+        all_logits = np.concatenate(all_logits)
+        all_obs = np.concatenate(all_obs)
+
+        ade = np.mean(np.linalg.norm(all_preds - all_gt, axis=2))
+        fde = np.mean(np.linalg.norm(all_preds[:,-1] - all_gt[:,-1], axis=1))
+        pred_int = np.argmax(all_logits, axis=1)
+        acc = accuracy_score(all_int, pred_int)
+        history["ade"].append(ade)
+        history["fde"].append(fde)
+        history["acc"].append(acc)
+
+        print(f"Val ADE: {ade:.4f} | FDE: {fde:.4f} | Intent Acc: {acc:.3f}")
+
+    # ====== 混淆矩阵 ======
+    cm = confusion_matrix(all_int, pred_int)
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=["Left","Straight","Right"],
+                yticklabels=["Left","Straight","Right"])
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("Intent Confusion Matrix")
+    plt.savefig("confusion_matrix_balanced.png", dpi=200)
+    plt.show()
+
+    # ====== 训练曲线 ======
+    plt.figure(figsize=(8,5))
+    plt.plot(history["ade"], label="ADE")
+    plt.plot(history["fde"], label="FDE")
+    plt.xlabel("Epoch")
+    plt.ylabel("Error (normalized)")
+    plt.legend()
+    plt.title("Trajectory Error Curve")
+    plt.savefig("train_curve_error_balanced.png", dpi=200)
+    plt.show()
+
+    plt.figure(figsize=(8,5))
+    plt.plot(history["acc"], label="Intent Acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Intent Classification Curve")
+    plt.savefig("train_curve_acc_balanced.png", dpi=200)
+    plt.show()
+
+    # ====== 随机轨迹示例 ======
+    for i in random.sample(range(len(all_obs)), min(5,len(all_obs))):
+        obs = all_obs[i][:,:2]
+        fut = all_gt[i]
+        pred = all_preds[i]
+        plot_trajectory(obs, fut, pred, img_w, img_h,
+                        save_path=f"traj_example_bal_{i}.png")
+
+    return model, history
+
+
+# =====================================
+# 7. 主程序入口
+# =====================================
+if __name__ == "__main__":
+    label_dir = "track_label"  # 轨迹标签文件夹
+    df = parse_track_labels_obb(label_dir, img_w=IMG_W, img_h=IMG_H)
+    print("Parsed dataframe shape:", df.shape)
+
+    samples = build_samples(df, T_obs=8, T_pred=12, stride=2, balance=True)
+    np.random.shuffle(samples)
+    n = len(samples)
+
+    train_set = TrajectoryDataset(samples[:int(0.7*n)])
+    val_set   = TrajectoryDataset(samples[int(0.7*n):int(0.85*n)])
+    test_set  = TrajectoryDataset(samples[int(0.85*n):])
+
+    train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+    val_loader   = DataLoader(val_set, batch_size=64, shuffle=False)
+
+    model = TrajLSTM().to(device)
+    model, history = train_model(model, train_loader, val_loader, epochs=30, lr=1e-3)
